@@ -112,8 +112,8 @@ fn redact_payloads(packet: &mut ResponsePacket, secrets: &[String]) {
     }
 }
 
-/// Redacts the decoded strings and object keys of a JSON value, so a
-/// secret written with JSON escapes is caught too. A value with nothing to
+/// Redacts the decoded strings, numbers and object keys of a JSON value, so
+/// a secret written with JSON escapes or as a number is caught too. A value with nothing to
 /// redact is returned unchanged.
 fn redacted_json(raw: Box<RawValue>, secrets: &[String]) -> Box<RawValue> {
     let text = raw.get();
@@ -132,6 +132,14 @@ fn redacted_json(raw: Box<RawValue>, secrets: &[String]) -> Box<RawValue> {
 fn redact_value(value: &mut serde_json::Value, secrets: &[String]) -> bool {
     match value {
         serde_json::Value::String(text) => redact_in_place(text, secrets),
+        serde_json::Value::Number(number) => {
+            let mut text = number.to_string();
+            if !redact_in_place(&mut text, secrets) {
+                return false;
+            }
+            *value = serde_json::Value::String(text);
+            true
+        }
         serde_json::Value::Array(items) => items
             .iter_mut()
             .fold(false, |changed, item| redact_value(item, secrets) | changed),
@@ -619,6 +627,19 @@ mod tests {
         let raw = RawValue::from_string(r#"{"b": "0x1",  "a": "\u0030x2"}"#.to_owned()).unwrap();
         let secrets = vec!["AbCdEf0123456789ghijKLMNopqr".to_owned()];
         assert_eq!(redacted_json(raw.clone(), &secrets).get(), raw.get());
+    }
+
+    #[test]
+    fn numeric_secret_is_redacted() {
+        let url: Url = "http://rpc.example/?token=1234567890123456"
+            .parse()
+            .unwrap();
+        let raw =
+            RawValue::from_string(r#"{"echo":1234567890123456,"code":7}"#.to_owned()).unwrap();
+        assert_eq!(
+            redacted_json(raw, &secrets(&url, None)).get(),
+            r#"{"code":7,"echo":"<redacted>"}"#
+        );
     }
 
     /// `text` with every character written as a JSON `\u` escape.
