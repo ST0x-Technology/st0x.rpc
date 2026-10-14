@@ -69,16 +69,16 @@ pub(crate) fn is_alchemy_jwt_url(url: &Url) -> bool {
         && matches!(url.path(), "/v2" | "/v2/")
 }
 
-/// An Alchemy URL that can authenticate neither way: not the bare JWT form
-/// and no `/v2/<key>` path, such as `http://`, a trailing-dot host or a
-/// missing `/v2`. Every call to it would get 401.
+/// An Alchemy URL that is neither the bare JWT form nor an `https` URL with a
+/// `/v2/<key>` path, such as a trailing-dot host, a missing `/v2`, or any
+/// `http://` URL (which would send a key in the clear).
 pub(crate) fn is_malformed_alchemy_jwt_url(url: &Url) -> bool {
     let alchemy_host = url.host_str().is_some_and(|host| {
         host.to_ascii_lowercase()
             .trim_end_matches('.')
             .ends_with(".g.alchemy.com")
     });
-    alchemy_host && !is_alchemy_jwt_url(url) && !has_path_key(url)
+    alchemy_host && !is_alchemy_jwt_url(url) && !(url.scheme() == "https" && has_path_key(url))
 }
 
 /// `/v2/<key>`, with an optional trailing slash.
@@ -133,6 +133,7 @@ mod tests {
             ("https://base-mainnet.g.alchemy.com/v2//", true),
             ("https://base-mainnet.g.alchemy.com/V2", true),
             ("https://base-mainnet.g.alchemy.com/v2/abc123/extra", true),
+            ("http://base-mainnet.g.alchemy.com/v2/abc123", true),
             ("https://base-mainnet.g.alchemy.com/v2", false),
             ("https://base-mainnet.g.alchemy.com/v2/abc123", false),
             ("https://base-mainnet.g.alchemy.com/v2/abc123/", false),

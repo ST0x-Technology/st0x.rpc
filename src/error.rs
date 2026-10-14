@@ -13,7 +13,7 @@ pub enum Error {
     InvalidUrl,
     #[error("RPC URL scheme must be http or https")]
     UnsupportedScheme,
-    #[error("RPC URL points at Alchemy but is neither the bare `https://<network>.g.alchemy.com/v2` form nor a `/v2/<key>` URL")]
+    #[error("RPC URL points at Alchemy but is neither the bare `https://<network>.g.alchemy.com/v2` form nor an `https` `/v2/<key>` URL")]
     MalformedAlchemyUrl,
     #[error("a bare Alchemy /v2 URL needs a KMS-signed JWT, but {missing} is not set")]
     MissingJwtConfig { missing: &'static str },

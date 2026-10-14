@@ -30,8 +30,9 @@ Which mode `connect` picks depends on the URL:
   accept stops startup.
 - Any other `http` or `https` URL: requests go out without a bearer token, and
   the env vars are not used. Other schemes, such as `wss`, are refused, and so
-  is an Alchemy URL that is neither the bare form nor `/v2/<key>` (for example
-  `http://` or a missing `/v2`), since every call to it would get 401.
+  is an Alchemy URL that is neither the bare form nor an `https` `/v2/<key>` URL
+  (for example a missing `/v2`, or any `http://` URL, which would send a key in
+  the clear).
 
 In both modes, errors and logs never contain the URL, redirects are not
 followed, and responses may be gzip-compressed and served over HTTP/2.
