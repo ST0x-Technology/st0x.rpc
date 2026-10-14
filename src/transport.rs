@@ -5,10 +5,11 @@
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use alloy_json_rpc::{RequestPacket, ResponsePacket};
+use alloy_json_rpc::{RequestPacket, ResponsePacket, ResponsePayload};
 use alloy_transport::{TransportError, TransportErrorKind, TransportFut, TransportResult};
 use reqwest::header::{HeaderValue, AUTHORIZATION};
 use reqwest::Url;
+use serde_json::value::RawValue;
 
 use crate::jwt::JwtMinter;
 use crate::{Error, Timeouts};
@@ -73,18 +74,39 @@ impl St0xHttp {
             .await
             .map_err(|err| TransportErrorKind::custom(err.without_url()))?;
 
+        let secrets = secrets(&self.url, token.as_deref());
         if !status.is_success() {
             return Err(TransportErrorKind::http_error(
                 status.as_u16(),
-                redacted_body(&body, &self.url, token.as_deref()),
+                redacted_body(&body, &secrets),
             ));
         }
-        serde_json::from_slice(&body).map_err(|err| {
-            TransportError::deser_err(
-                without_input(&err),
-                redacted_body(&body, &self.url, token.as_deref()),
-            )
-        })
+        let mut packet: ResponsePacket = serde_json::from_slice(&body).map_err(|err| {
+            TransportError::deser_err(without_input(&err), redacted_body(&body, &secrets))
+        })?;
+        redact_failures(&mut packet, &secrets);
+        Ok(packet)
+    }
+}
+
+/// JSON-RPC error responses reach the caller's error text too, so their
+/// `message` and `data` get the same redaction as an error body.
+fn redact_failures(packet: &mut ResponsePacket, secrets: &[String]) {
+    if secrets.is_empty() {
+        return;
+    }
+    let responses = match packet {
+        ResponsePacket::Single(response) => std::slice::from_mut(response),
+        ResponsePacket::Batch(responses) => responses.as_mut_slice(),
+    };
+    for response in responses {
+        if let ResponsePayload::Failure(error) = &mut response.payload {
+            error.message = redacted(&error.message, secrets).into();
+            error.data = error
+                .data
+                .take()
+                .and_then(|data| RawValue::from_string(redacted(data.get(), secrets)).ok());
+        }
     }
 }
 
@@ -99,24 +121,31 @@ fn without_input(err: &serde_json::Error) -> serde_json::Error {
     ))
 }
 
-/// The response text for an error, without the JWT and the URL's long path
-/// segments, query values and credentials (an endpoint can echo its request),
-/// and cut to `MAX_ERROR_BODY` bytes.
-fn redacted_body(body: &[u8], url: &Url, token: Option<&str>) -> String {
-    let mut text = String::from_utf8_lossy(body).into_owned();
+/// What an endpoint can echo from its request: the JWT and the URL's long
+/// path segments, query values and credentials.
+fn secrets(url: &Url, token: Option<&str>) -> Vec<String> {
     let path = url.path_segments().into_iter().flatten().map(str::to_owned);
     let query = url.query_pairs().map(|(_, value)| value.into_owned());
     let credentials = [url.username().to_owned()]
         .into_iter()
         .chain(url.password().map(str::to_owned));
-    for secret in path
-        .chain(query)
+    path.chain(query)
         .chain(credentials)
         .chain(token.map(str::to_owned))
         .filter(|part| part.len() >= MIN_SECRET_LEN)
-    {
-        text = text.replace(&secret, "<redacted>");
-    }
+        .collect()
+}
+
+fn redacted(text: &str, secrets: &[String]) -> String {
+    secrets.iter().fold(text.to_owned(), |text, secret| {
+        text.replace(secret, "<redacted>")
+    })
+}
+
+/// The response text for an error, redacted and cut to `MAX_ERROR_BODY`
+/// bytes.
+fn redacted_body(body: &[u8], secrets: &[String]) -> String {
+    let mut text = redacted(&String::from_utf8_lossy(body), secrets);
     if text.len() > MAX_ERROR_BODY {
         let end = (0..=MAX_ERROR_BODY)
             .rev()
@@ -423,10 +452,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn json_rpc_error_payloads_are_redacted() {
+        const KEY: &str = "AbCdEf0123456789ghijKLMNopqr";
+        let server = MockServer::start_async().await;
+        let minter = minter(&server).await;
+        let keyed = format!("/v2/{KEY}");
+        server.mock(|when, then| {
+            when.method("POST").path(keyed.as_str());
+            then.respond_with(|request| {
+                let authorization = request.headers()["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body().to_vec()).unwrap();
+                let error = |call: &serde_json::Value| {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": call["id"],
+                        "error": {
+                            "code": -32000,
+                            "message": format!("no route for /v2/{KEY}"),
+                            "data": { "echo": authorization },
+                        },
+                    })
+                };
+                let response = match body.as_array() {
+                    Some(calls) => calls.iter().map(error).collect(),
+                    None => error(&body),
+                };
+                httpmock::HttpMockResponse::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(response.to_string())
+                    .build()
+            });
+        });
+        let jwt = minter.bearer().await.unwrap();
+        let mut transport = St0xHttp::new(
+            server.url(&keyed).parse().unwrap(),
+            Some(minter),
+            Timeouts::default(),
+        )
+        .unwrap();
+
+        for packet in [
+            RequestPacket::Single(request_with_stale_authorization(1)),
+            RequestPacket::Batch(vec![
+                request_with_stale_authorization(2),
+                request_with_stale_authorization(3),
+            ]),
+        ] {
+            let response = transport.call(packet).await.unwrap();
+            let failures: Vec<_> = response
+                .responses()
+                .iter()
+                .map(|response| match &response.payload {
+                    ResponsePayload::Failure(error) => error.clone(),
+                    ResponsePayload::Success(_) => panic!("expected an error payload"),
+                })
+                .collect();
+            assert!(!failures.is_empty());
+            for error in failures {
+                let rendered = format!("{error} {error:?}");
+                assert_eq!(error.code, -32000);
+                assert!(!rendered.contains(KEY), "{rendered}");
+                assert!(!rendered.contains(&jwt), "{rendered}");
+                assert!(
+                    rendered.contains("no route for /v2/<redacted>"),
+                    "{rendered}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn long_error_body_is_capped() {
         let url: Url = "https://base-mainnet.g.alchemy.com/v2".parse().unwrap();
-        let text = redacted_body("é".repeat(MAX_ERROR_BODY).as_bytes(), &url, None);
+        let text = redacted_body("é".repeat(MAX_ERROR_BODY).as_bytes(), &secrets(&url, None));
         assert!(text.len() <= MAX_ERROR_BODY + 3);
         assert!(text.ends_with("..."));
     }
