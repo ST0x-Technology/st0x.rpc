@@ -11,11 +11,10 @@ use reqwest::header::{HeaderValue, AUTHORIZATION};
 use reqwest::Url;
 use serde_json::value::RawValue;
 
+use crate::error::capped;
 use crate::jwt::JwtMinter;
 use crate::{Error, Timeouts};
 
-/// Response text kept in an error is cut to this many bytes.
-const MAX_ERROR_BODY: usize = 1024;
 /// URL parts at least this long are treated as secrets: API keys are
 /// 32 characters, network names and `v2` are short.
 const MIN_SECRET_LEN: usize = 16;
@@ -145,16 +144,7 @@ fn redacted(text: &str, secrets: &[String]) -> String {
 /// The response text for an error, redacted and cut to `MAX_ERROR_BODY`
 /// bytes.
 fn redacted_body(body: &[u8], secrets: &[String]) -> String {
-    let mut text = redacted(&String::from_utf8_lossy(body), secrets);
-    if text.len() > MAX_ERROR_BODY {
-        let end = (0..=MAX_ERROR_BODY)
-            .rev()
-            .find(|&index| text.is_char_boundary(index))
-            .unwrap_or(0);
-        text.truncate(end);
-        text.push_str("...");
-    }
-    text
+    capped(redacted(&String::from_utf8_lossy(body), secrets))
 }
 
 impl tower::Service<RequestPacket> for St0xHttp {
@@ -179,6 +169,7 @@ mod tests {
     use tower::Service as _;
 
     use super::*;
+    use crate::error::MAX_ERROR_BODY;
     use crate::kms::JwsSigner;
     use crate::test_support::{
         kms_signer, mock_public_key, mock_rpc, mock_sign, mock_token, ACCESS_TOKEN, CHAIN_ID,

@@ -29,7 +29,9 @@ Which mode `connect` picks depends on the URL:
   signer and calls `eth_chainId` within 10 seconds, so a key Alchemy does not
   accept stops startup.
 - Any other `http` or `https` URL: requests go out without a bearer token, and
-  the env vars are not used. Other schemes, such as `wss`, are refused.
+  the env vars are not used. Other schemes, such as `wss`, are refused, and so
+  is an Alchemy URL that is neither the bare form nor `/v2/<key>` (for example
+  `http://` or a missing `/v2`), since every call to it would get 401.
 
 In both modes, errors and logs never contain the URL, redirects are not
 followed, and responses may be gzip-compressed and served over HTTP/2.

@@ -16,6 +16,7 @@ use p256::pkcs8::DecodePublicKey as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::error::capped;
 use crate::Error;
 
 pub(crate) const KMS_BASE_URL: &str = "https://cloudkms.googleapis.com/v1";
@@ -180,7 +181,7 @@ async fn kms_success(response: reqwest::Response) -> Result<reqwest::Response, E
     }
     Err(Error::KmsStatus {
         status: status.as_u16(),
-        body: response.text().await.unwrap_or_default(),
+        body: capped(response.text().await.unwrap_or_default()),
     })
 }
 
@@ -214,6 +215,7 @@ mod tests {
     use p256::ecdsa::SigningKey;
 
     use super::*;
+    use crate::error::MAX_ERROR_BODY;
     use crate::test_support::{
         kms_signature_response, kms_signer, mock_public_key, mock_sign, mock_token,
         sign_requested_digest, sign_response, signing_key, token_source, ACCESS_TOKEN, KEY_VERSION,
@@ -370,6 +372,16 @@ mod tests {
         mock_public_key(&server, REQUIRED_ALGORITHM);
         mock_sign_with(&server, move |_| json_response(status, body));
         kms_signer(&server).await.sign(MESSAGE).await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn oversized_kms_error_body_is_capped() {
+        let body: &'static str = "x".repeat(10 * MAX_ERROR_BODY).leak();
+        let err = sign_error(503, body).await;
+        let Error::KmsStatus { status: 503, body } = err else {
+            panic!("expected KmsStatus, got {err:?}");
+        };
+        assert_eq!(body.len(), MAX_ERROR_BODY + "...".len());
     }
 
     #[tokio::test]

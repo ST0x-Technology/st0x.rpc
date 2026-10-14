@@ -69,16 +69,25 @@ pub(crate) fn is_alchemy_jwt_url(url: &Url) -> bool {
         && matches!(url.path(), "/v2" | "/v2/")
 }
 
-/// An Alchemy `/v2` endpoint that fails [`is_alchemy_jwt_url`], such as
-/// `http://` or a trailing-dot host: meant for JWT mode, but would get 401s.
+/// An Alchemy URL that can authenticate neither way: not the bare JWT form
+/// and no `/v2/<key>` path, such as `http://`, a trailing-dot host or a
+/// missing `/v2`. Every call to it would get 401.
 pub(crate) fn is_malformed_alchemy_jwt_url(url: &Url) -> bool {
-    !is_alchemy_jwt_url(url)
-        && matches!(url.path(), "/v2" | "/v2/")
-        && url.host_str().is_some_and(|host| {
-            host.to_ascii_lowercase()
-                .trim_end_matches('.')
-                .ends_with(".g.alchemy.com")
-        })
+    let alchemy_host = url.host_str().is_some_and(|host| {
+        host.to_ascii_lowercase()
+            .trim_end_matches('.')
+            .ends_with(".g.alchemy.com")
+    });
+    alchemy_host && !is_alchemy_jwt_url(url) && !has_path_key(url)
+}
+
+/// `/v2/<key>`, with an optional trailing slash.
+fn has_path_key(url: &Url) -> bool {
+    let path = url.path();
+    path.strip_suffix('/')
+        .unwrap_or(path)
+        .strip_prefix("/v2/")
+        .is_some_and(|key| !key.is_empty() && !key.contains('/'))
 }
 
 #[cfg(test)]
@@ -120,8 +129,13 @@ mod tests {
             ("https://base-mainnet.g.alchemy.com./v2", true),
             ("https://base-mainnet.g.alchemy.com:8443/v2/", true),
             ("https://base-mainnet.g.alchemy.com/v2?key=abc", true),
+            ("https://base-mainnet.g.alchemy.com", true),
+            ("https://base-mainnet.g.alchemy.com/v2//", true),
+            ("https://base-mainnet.g.alchemy.com/V2", true),
+            ("https://base-mainnet.g.alchemy.com/v2/abc123/extra", true),
             ("https://base-mainnet.g.alchemy.com/v2", false),
             ("https://base-mainnet.g.alchemy.com/v2/abc123", false),
+            ("https://base-mainnet.g.alchemy.com/v2/abc123/", false),
             ("https://mainnet.base.org/v2", false),
         ];
         for (url, expected) in cases {

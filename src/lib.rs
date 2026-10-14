@@ -291,6 +291,7 @@ mod tests {
         for url in [
             "http://base-mainnet.g.alchemy.com/v2",
             "https://base-mainnet.g.alchemy.com./v2",
+            "https://base-mainnet.g.alchemy.com",
         ] {
             let err = connect_with(url, both()).await.unwrap_err();
             assert!(matches!(err, Error::MalformedAlchemyUrl), "{url}: {err:?}");

@@ -13,7 +13,7 @@ pub enum Error {
     InvalidUrl,
     #[error("RPC URL scheme must be http or https")]
     UnsupportedScheme,
-    #[error("RPC URL points at an Alchemy /v2 endpoint but is not the bare `https://<network>.g.alchemy.com/v2` form")]
+    #[error("RPC URL points at Alchemy but is neither the bare `https://<network>.g.alchemy.com/v2` form nor a `/v2/<key>` URL")]
     MalformedAlchemyUrl,
     #[error("a bare Alchemy /v2 URL needs a KMS-signed JWT, but {missing} is not set")]
     MissingJwtConfig { missing: &'static str },
@@ -50,6 +50,22 @@ pub enum Error {
     MintedExpired,
     #[error("Alchemy JWT startup check failed")]
     Rpc(#[source] TransportError),
+}
+
+/// Response text kept in an error is cut to this many bytes.
+pub(crate) const MAX_ERROR_BODY: usize = 1024;
+
+/// `text` cut to `MAX_ERROR_BODY` bytes at a character boundary.
+pub(crate) fn capped(mut text: String) -> String {
+    if text.len() > MAX_ERROR_BODY {
+        let end = (0..=MAX_ERROR_BODY)
+            .rev()
+            .find(|&index| text.is_char_boundary(index))
+            .unwrap_or(0);
+        text.truncate(end);
+        text.push_str("...");
+    }
+    text
 }
 
 impl From<reqwest::Error> for Error {
