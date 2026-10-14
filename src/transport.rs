@@ -83,14 +83,15 @@ impl St0xHttp {
         let mut packet: ResponsePacket = serde_json::from_slice(&body).map_err(|err| {
             TransportError::deser_err(without_input(&err), redacted_body(&body, &secrets))
         })?;
-        redact_failures(&mut packet, &secrets);
+        redact_payloads(&mut packet, &secrets);
         Ok(packet)
     }
 }
 
-/// JSON-RPC error responses reach the caller's error text too, so their
-/// `message` and `data` get the same redaction as an error body.
-fn redact_failures(packet: &mut ResponsePacket, secrets: &[String]) {
+/// Every payload can reach the caller's error text: a failure's `message`
+/// and `data`, and a `result` that does not deserialize into the caller's
+/// type. They get the same redaction as an error body.
+fn redact_payloads(packet: &mut ResponsePacket, secrets: &[String]) {
     if secrets.is_empty() {
         return;
     }
@@ -99,14 +100,61 @@ fn redact_failures(packet: &mut ResponsePacket, secrets: &[String]) {
         ResponsePacket::Batch(responses) => responses.as_mut_slice(),
     };
     for response in responses {
-        if let ResponsePayload::Failure(error) = &mut response.payload {
-            error.message = redacted(&error.message, secrets).into();
-            error.data = error
-                .data
-                .take()
-                .and_then(|data| RawValue::from_string(redacted(data.get(), secrets)).ok());
+        match &mut response.payload {
+            ResponsePayload::Success(result) => {
+                *result = redacted_json(std::mem::take(result), secrets);
+            }
+            ResponsePayload::Failure(error) => {
+                error.message = redacted(&error.message, secrets).into();
+                error.data = error.data.take().map(|data| redacted_json(data, secrets));
+            }
         }
     }
+}
+
+/// Redacts the decoded strings and object keys of a JSON value, so a
+/// secret written with JSON escapes is caught too. A value with nothing to
+/// redact is returned unchanged.
+fn redacted_json(raw: Box<RawValue>, secrets: &[String]) -> Box<RawValue> {
+    let text = raw.get();
+    if !text.contains('\\') && !secrets.iter().any(|secret| text.contains(secret.as_str())) {
+        return raw;
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return RawValue::from_string(redacted(text, secrets)).unwrap_or(raw);
+    };
+    if !redact_value(&mut value, secrets) {
+        return raw;
+    }
+    serde_json::value::to_raw_value(&value).unwrap_or(raw)
+}
+
+fn redact_value(value: &mut serde_json::Value, secrets: &[String]) -> bool {
+    match value {
+        serde_json::Value::String(text) => redact_in_place(text, secrets),
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |changed, item| redact_value(item, secrets) | changed),
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            for (mut key, mut item) in std::mem::take(map) {
+                changed |= redact_in_place(&mut key, secrets);
+                changed |= redact_value(&mut item, secrets);
+                map.insert(key, item);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn redact_in_place(text: &mut String, secrets: &[String]) -> bool {
+    let redacted = redacted(text, secrets);
+    if redacted == *text {
+        return false;
+    }
+    *text = redacted;
+    true
 }
 
 /// serde's message can quote the input, such as an echoed keyed path, so
@@ -465,7 +513,11 @@ mod tests {
                         "error": {
                             "code": -32000,
                             "message": format!("no route for /v2/{KEY}"),
-                            "data": { "echo": authorization },
+                            "data": {
+                                "echo": authorization,
+                                "escaped": "ESCAPED_KEY",
+                                "ESCAPED_JWT": true,
+                            },
                         },
                     })
                 };
@@ -473,10 +525,16 @@ mod tests {
                     Some(calls) => calls.iter().map(error).collect(),
                     None => error(&body),
                 };
+                let jwt = authorization.trim_start_matches("Bearer ");
                 httpmock::HttpMockResponse::builder()
                     .status(200)
                     .header("content-type", "application/json")
-                    .body(response.to_string())
+                    .body(
+                        response
+                            .to_string()
+                            .replace("ESCAPED_KEY", &json_escaped(KEY))
+                            .replace("ESCAPED_JWT", &json_escaped(jwt)),
+                    )
                     .build()
             });
         });
@@ -506,7 +564,9 @@ mod tests {
                 .collect();
             assert!(!failures.is_empty());
             for error in failures {
-                let rendered = format!("{error} {error:?}");
+                let data: serde_json::Value =
+                    serde_json::from_str(error.data.as_ref().unwrap().get()).unwrap();
+                let rendered = format!("{error} {error:?} {data}");
                 assert_eq!(error.code, -32000);
                 assert!(!rendered.contains(KEY), "{rendered}");
                 assert!(!rendered.contains(&jwt), "{rendered}");
@@ -516,6 +576,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn mismatched_success_results_are_redacted() {
+        const KEY: &str = "AbCdEf0123456789ghijKLMNopqr";
+        let server = MockServer::start_async().await;
+        let minter = minter(&server).await;
+        let jwt = minter.bearer().await.unwrap();
+        let keyed = format!("/v2/{KEY}");
+        for (path, echo) in [
+            ("/literal", format!("{keyed} {jwt}")),
+            (
+                "/escaped",
+                format!("{} {}", json_escaped(&keyed), json_escaped(&jwt)),
+            ),
+        ] {
+            let url_path = format!("{path}{keyed}");
+            server.mock(|when, then| {
+                when.method("POST").path(url_path.as_str());
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(format!(
+                        r#"{{"jsonrpc":"2.0","id":0,"result":"no route for {echo}"}}"#
+                    ));
+            });
+            let err = client(&server.url(&url_path), Some(Arc::clone(&minter)))
+                .request_noparams::<std::collections::HashMap<String, String>>(
+                    "eth_getBlockByNumber",
+                )
+                .await
+                .unwrap_err();
+            let rendered = format!("{err} {err:?}");
+            assert!(!rendered.contains(KEY), "{rendered}");
+            assert!(!rendered.contains(&jwt), "{rendered}");
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn payloads_without_secrets_are_untouched() {
+        let raw = RawValue::from_string(r#"{"b": "0x1",  "a": "\u0030x2"}"#.to_owned()).unwrap();
+        let secrets = vec!["AbCdEf0123456789ghijKLMNopqr".to_owned()];
+        assert_eq!(redacted_json(raw.clone(), &secrets).get(), raw.get());
+    }
+
+    /// `text` with every character written as a JSON `\u` escape.
+    fn json_escaped(text: &str) -> String {
+        use std::fmt::Write as _;
+
+        text.chars().fold(String::new(), |mut escaped, c| {
+            write!(escaped, "\\u{:04x}", u32::from(c)).unwrap();
+            escaped
+        })
     }
 
     #[test]
