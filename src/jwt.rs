@@ -316,9 +316,13 @@ mod tests {
         }
 
         async fn wait_for_calls(&self, calls: usize) {
-            while self.calls() < calls {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.calls() < calls {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("signer was not called");
         }
 
         fn set_failing(&self, fail: bool) {

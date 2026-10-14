@@ -2,8 +2,10 @@ use alloy_transport::TransportError;
 
 /// Errors from building an RPC client or authenticating its requests.
 ///
-/// No variant holds the RPC URL, a JWT or a Google access token. HTTP
-/// bodies appear only for non-2xx KMS responses (Google error JSON).
+/// No variant holds the RPC URL, a JWT or a Google access token. Response
+/// text appears in two places: non-2xx KMS responses (Google error JSON), and
+/// `Rpc`, which can hold RPC response text from the startup `eth_chainId`
+/// check with URL secrets and the JWT redacted, capped at 1 KiB.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {

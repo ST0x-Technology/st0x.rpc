@@ -49,12 +49,14 @@ impl St0xHttp {
 
     async fn send(self, request: RequestPacket) -> TransportResult<ResponsePacket> {
         let mut headers = request.headers();
+        let mut token = None;
         if let Some(minter) = &self.minter {
-            let token = minter.bearer().await.map_err(TransportErrorKind::custom)?;
-            let mut bearer = HeaderValue::try_from(format!("Bearer {token}"))
+            let jwt = minter.bearer().await.map_err(TransportErrorKind::custom)?;
+            let mut bearer = HeaderValue::try_from(format!("Bearer {jwt}"))
                 .map_err(TransportErrorKind::custom)?;
             bearer.set_sensitive(true);
             headers.insert(AUTHORIZATION, bearer);
+            token = Some(jwt);
         }
 
         let response = self
@@ -74,18 +76,33 @@ impl St0xHttp {
         if !status.is_success() {
             return Err(TransportErrorKind::http_error(
                 status.as_u16(),
-                redacted_body(&body, &self.url),
+                redacted_body(&body, &self.url, token.as_deref()),
             ));
         }
-        serde_json::from_slice(&body)
-            .map_err(|err| TransportError::deser_err(err, redacted_body(&body, &self.url)))
+        serde_json::from_slice(&body).map_err(|err| {
+            TransportError::deser_err(
+                without_input(&err),
+                redacted_body(&body, &self.url, token.as_deref()),
+            )
+        })
     }
 }
 
-/// The response text for an error, without the URL's long path segments,
-/// query values and credentials (an endpoint can echo its keyed path), and
-/// cut to `MAX_ERROR_BODY` bytes.
-fn redacted_body(body: &[u8], url: &Url) -> String {
+/// serde's message can quote the input, such as an echoed keyed path, so
+/// keep only the error class and position.
+fn without_input(err: &serde_json::Error) -> serde_json::Error {
+    <serde_json::Error as serde::de::Error>::custom(format!(
+        "{:?} error at line {} column {}",
+        err.classify(),
+        err.line(),
+        err.column()
+    ))
+}
+
+/// The response text for an error, without the JWT and the URL's long path
+/// segments, query values and credentials (an endpoint can echo its request),
+/// and cut to `MAX_ERROR_BODY` bytes.
+fn redacted_body(body: &[u8], url: &Url, token: Option<&str>) -> String {
     let mut text = String::from_utf8_lossy(body).into_owned();
     let path = url.path_segments().into_iter().flatten().map(str::to_owned);
     let query = url.query_pairs().map(|(_, value)| value.into_owned());
@@ -95,6 +112,7 @@ fn redacted_body(body: &[u8], url: &Url) -> String {
     for secret in path
         .chain(query)
         .chain(credentials)
+        .chain(token.map(str::to_owned))
         .filter(|part| part.len() >= MIN_SECRET_LEN)
     {
         text = text.replace(&secret, "<redacted>");
@@ -357,6 +375,7 @@ mod tests {
         for (path, status, body) in [
             ("/http-error", 500, format!("no route for {keyed}")),
             ("/bad-json", 200, format!("<html>{keyed}</html>")),
+            ("/json-string", 200, format!(r#""no route for {keyed}""#)),
         ] {
             let url_path = format!("{path}{keyed}");
             server.mock(|when, then| {
@@ -373,10 +392,41 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn echoed_jwt_is_redacted_from_errors() {
+        let server = MockServer::start_async().await;
+        let minter = minter(&server).await;
+        server.mock(|when, then| {
+            when.method("POST").path("/v2");
+            then.respond_with(|request| {
+                let authorization = request.headers()["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                httpmock::HttpMockResponse::builder()
+                    .status(401)
+                    .body(format!("rejected {authorization}"))
+                    .build()
+            });
+        });
+        let jwt = minter.bearer().await.unwrap();
+
+        let err = client(&server.url("/v2"), Some(minter))
+            .request_noparams::<String>("eth_chainId")
+            .await
+            .unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains(&jwt), "{rendered}");
+        assert!(
+            rendered.contains("rejected Bearer <redacted>"),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn long_error_body_is_capped() {
         let url: Url = "https://base-mainnet.g.alchemy.com/v2".parse().unwrap();
-        let text = redacted_body("é".repeat(MAX_ERROR_BODY).as_bytes(), &url);
+        let text = redacted_body("é".repeat(MAX_ERROR_BODY).as_bytes(), &url, None);
         assert!(text.len() <= MAX_ERROR_BODY + 3);
         assert!(text.ends_with("..."));
     }
