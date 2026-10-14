@@ -90,7 +90,8 @@ impl St0xHttp {
 
 /// Every payload can reach the caller's error text: a failure's `message`
 /// and `data`, and a `result` that does not deserialize into the caller's
-/// type. They get the same redaction as an error body.
+/// type. They get the same redaction as an error body, except that numbers
+/// in a `result` stay numbers, so a caller asking for a `u64` still gets one.
 fn redact_payloads(packet: &mut ResponsePacket, secrets: &[String]) {
     if secrets.is_empty() {
         return;
@@ -102,20 +103,32 @@ fn redact_payloads(packet: &mut ResponsePacket, secrets: &[String]) {
     for response in responses {
         match &mut response.payload {
             ResponsePayload::Success(result) => {
-                *result = redacted_json(std::mem::take(result), secrets);
+                *result = redacted_json(std::mem::take(result), secrets, Numbers::Keep);
             }
             ResponsePayload::Failure(error) => {
                 error.message = redacted(&error.message, secrets).into();
-                error.data = error.data.take().map(|data| redacted_json(data, secrets));
+                error.data = error
+                    .data
+                    .take()
+                    .map(|data| redacted_json(data, secrets, Numbers::Redact));
             }
         }
     }
 }
 
-/// Redacts the decoded strings, numbers and object keys of a JSON value, so
-/// a secret written with JSON escapes or as a number is caught too. A value with nothing to
-/// redact is returned unchanged.
-fn redacted_json(raw: Box<RawValue>, secrets: &[String]) -> Box<RawValue> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Numbers {
+    /// A number holding a secret becomes the string `"<redacted>"`.
+    Redact,
+    /// Numbers keep their type and value.
+    Keep,
+}
+
+/// Redacts the decoded strings and object keys of a JSON value, and its
+/// numbers unless told to keep them, so a secret written with JSON escapes
+/// or as a number is caught too. A value with nothing to redact is returned
+/// unchanged.
+fn redacted_json(raw: Box<RawValue>, secrets: &[String], numbers: Numbers) -> Box<RawValue> {
     let text = raw.get();
     if !text.contains('\\') && !secrets.iter().any(|secret| text.contains(secret.as_str())) {
         return raw;
@@ -123,16 +136,16 @@ fn redacted_json(raw: Box<RawValue>, secrets: &[String]) -> Box<RawValue> {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) else {
         return RawValue::from_string(redacted(text, secrets)).unwrap_or(raw);
     };
-    if !redact_value(&mut value, secrets) {
+    if !redact_value(&mut value, secrets, numbers) {
         return raw;
     }
     serde_json::value::to_raw_value(&value).unwrap_or(raw)
 }
 
-fn redact_value(value: &mut serde_json::Value, secrets: &[String]) -> bool {
+fn redact_value(value: &mut serde_json::Value, secrets: &[String], numbers: Numbers) -> bool {
     match value {
         serde_json::Value::String(text) => redact_in_place(text, secrets),
-        serde_json::Value::Number(number) => {
+        serde_json::Value::Number(number) if numbers == Numbers::Redact => {
             let mut text = number.to_string();
             if !redact_in_place(&mut text, secrets) {
                 return false;
@@ -140,14 +153,14 @@ fn redact_value(value: &mut serde_json::Value, secrets: &[String]) -> bool {
             *value = serde_json::Value::String(text);
             true
         }
-        serde_json::Value::Array(items) => items
-            .iter_mut()
-            .fold(false, |changed, item| redact_value(item, secrets) | changed),
+        serde_json::Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
+            redact_value(item, secrets, numbers) | changed
+        }),
         serde_json::Value::Object(map) => {
             let mut changed = false;
             for (mut key, mut item) in std::mem::take(map) {
                 changed |= redact_in_place(&mut key, secrets);
-                changed |= redact_value(&mut item, secrets);
+                changed |= redact_value(&mut item, secrets, numbers);
                 map.insert(key, item);
             }
             changed
@@ -626,7 +639,37 @@ mod tests {
     fn payloads_without_secrets_are_untouched() {
         let raw = RawValue::from_string(r#"{"b": "0x1",  "a": "\u0030x2"}"#.to_owned()).unwrap();
         let secrets = vec!["AbCdEf0123456789ghijKLMNopqr".to_owned()];
-        assert_eq!(redacted_json(raw.clone(), &secrets).get(), raw.get());
+        assert_eq!(
+            redacted_json(raw.clone(), &secrets, Numbers::Redact).get(),
+            raw.get()
+        );
+    }
+
+    #[tokio::test]
+    async fn numeric_result_matching_a_secret_keeps_its_type() {
+        const SECRET: u64 = 1_234_567_890_123_456;
+        let server = MockServer::start_async().await;
+        let path = format!("/rpc/{SECRET}");
+        server.mock(|when, then| {
+            when.method("POST").path(path.as_str());
+            then.respond_with(|request| {
+                let call: serde_json::Value =
+                    serde_json::from_slice(&request.body().to_vec()).unwrap();
+                let body =
+                    serde_json::json!({ "jsonrpc": "2.0", "id": call["id"], "result": SECRET });
+                httpmock::HttpMockResponse::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(body.to_string())
+                    .build()
+            });
+        });
+
+        let result: u64 = client(&server.url(&path), None)
+            .request_noparams("eth_blockNumber")
+            .await
+            .unwrap();
+        assert_eq!(result, SECRET);
     }
 
     #[test]
@@ -637,8 +680,12 @@ mod tests {
         let raw =
             RawValue::from_string(r#"{"echo":1234567890123456,"code":7}"#.to_owned()).unwrap();
         assert_eq!(
-            redacted_json(raw, &secrets(&url, None)).get(),
+            redacted_json(raw.clone(), &secrets(&url, None), Numbers::Redact).get(),
             r#"{"code":7,"echo":"<redacted>"}"#
+        );
+        assert_eq!(
+            redacted_json(raw.clone(), &secrets(&url, None), Numbers::Keep).get(),
+            raw.get()
         );
     }
 
