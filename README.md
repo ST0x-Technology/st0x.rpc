@@ -31,8 +31,10 @@ Which mode `connect` picks depends on the URL:
 - Any other `http` or `https` URL: requests go out without a bearer token, and
   the env vars are not used. Other schemes, such as `wss`, are refused.
 
-In both modes, errors and logs never contain the URL, and redirects are not
-followed.
+In both modes, errors and logs never contain the URL, redirects are not
+followed, and responses may be gzip-compressed and served over HTTP/2.
+`connect_with_timeouts` adds connect and per-request time limits; `connect` and
+`connect_with` set none.
 
 The JWT has header `{"alg":"ES256","typ":"JWT","kid":<kid>}` and claims
 `{"iat":<now>,"exp":<now+600>}`. It is cached; in its last two minutes a

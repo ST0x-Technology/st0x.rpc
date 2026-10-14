@@ -11,7 +11,7 @@ use reqwest::header::{HeaderValue, AUTHORIZATION};
 use reqwest::Url;
 
 use crate::jwt::JwtMinter;
-use crate::Error;
+use crate::{Error, Timeouts};
 
 #[derive(Clone)]
 pub(crate) struct St0xHttp {
@@ -21,10 +21,19 @@ pub(crate) struct St0xHttp {
 }
 
 impl St0xHttp {
-    pub(crate) fn new(url: Url, minter: Option<Arc<JwtMinter>>) -> Result<Self, Error> {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+    pub(crate) fn new(
+        url: Url,
+        minter: Option<Arc<JwtMinter>>,
+        timeouts: Timeouts,
+    ) -> Result<Self, Error> {
+        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        if let Some(connect) = timeouts.connect {
+            builder = builder.connect_timeout(connect);
+        }
+        if let Some(request) = timeouts.request {
+            builder = builder.timeout(request);
+        }
+        let client = builder.build()?;
         Ok(Self {
             client,
             url,
@@ -104,8 +113,14 @@ mod tests {
     }
 
     fn client(url: &str, minter: Option<Arc<JwtMinter>>) -> RpcClient {
-        ClientBuilder::default()
-            .transport(St0xHttp::new(url.parse().unwrap(), minter).unwrap(), true)
+        client_with(url, minter, Timeouts::default())
+    }
+
+    fn client_with(url: &str, minter: Option<Arc<JwtMinter>>, timeouts: Timeouts) -> RpcClient {
+        ClientBuilder::default().transport(
+            St0xHttp::new(url.parse().unwrap(), minter, timeouts).unwrap(),
+            true,
+        )
     }
 
     /// An `eth_chainId` request whose packet already carries
@@ -140,6 +155,7 @@ mod tests {
         let mut transport = St0xHttp::new(
             server.url("/v2").parse().unwrap(),
             Some(Arc::clone(&minter)),
+            Timeouts::default(),
         )
         .unwrap();
 
@@ -225,6 +241,56 @@ mod tests {
         let rendered = format!("{err} {err:?}");
         assert!(!rendered.contains(SECRET_PATH), "{rendered}");
         assert!(!rendered.contains(&jwt), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn request_timeout_bounds_a_hung_endpoint() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method("POST").path(SECRET_PATH);
+            then.status(200).delay(std::time::Duration::from_secs(5));
+        });
+        let timeouts = Timeouts {
+            request: Some(std::time::Duration::from_millis(200)),
+            ..Timeouts::default()
+        };
+
+        let started = std::time::Instant::now();
+        let err = client_with(&server.url(SECRET_PATH), None, timeouts)
+            .request_noparams::<String>("eth_chainId")
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{err:?}"
+        );
+        assert_no_secrets(&format!("{err} {err:?}"), &server, None);
+    }
+
+    #[tokio::test]
+    async fn accepts_gzip_responses() {
+        use std::io::Write as _;
+
+        let server = MockServer::start_async().await;
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(format!(r#"{{"jsonrpc":"2.0","id":0,"result":"{CHAIN_ID}"}}"#).as_bytes())
+            .unwrap();
+        let body = gzip.finish().unwrap();
+        server.mock(|when, then| {
+            when.method("POST")
+                .path("/rpc")
+                .header_includes("accept-encoding", "gzip");
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("content-encoding", "gzip")
+                .body(body);
+        });
+
+        let chain_id: String = client(&server.url("/rpc"), None)
+            .request_noparams("eth_chainId")
+            .await
+            .unwrap();
+        assert_eq!(chain_id, CHAIN_ID);
     }
 
     #[tokio::test]

@@ -53,7 +53,26 @@ pub async fn connect(url: &str) -> Result<RpcClient, Error> {
 /// succeeds, so a key Alchemy does not accept stops startup. Any other URL
 /// gets a client without a bearer token and no startup call.
 pub async fn connect_with(url: &str, jwt: JwtEnv) -> Result<RpcClient, Error> {
-    connect_inner(url, jwt, Deps::production()).await
+    connect_with_timeouts(url, jwt, Timeouts::default()).await
+}
+
+/// HTTP time limits on each request the client sends. `None` is no limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Timeouts {
+    /// Limit on opening a connection.
+    pub connect: Option<Duration>,
+    /// Limit on a whole request, from connecting to the last response byte.
+    /// Minting a JWT happens before the request and does not count.
+    pub request: Option<Duration>,
+}
+
+/// [`connect_with`], with time limits on each HTTP request.
+pub async fn connect_with_timeouts(
+    url: &str,
+    jwt: JwtEnv,
+    timeouts: Timeouts,
+) -> Result<RpcClient, Error> {
+    connect_inner(url, jwt, timeouts, Deps::production()).await
 }
 
 /// Whether `connect` calls `url` with a KMS-signed JWT: a bare
@@ -81,7 +100,12 @@ impl Deps {
     }
 }
 
-async fn connect_inner(url: &str, jwt: JwtEnv, deps: Deps) -> Result<RpcClient, Error> {
+async fn connect_inner(
+    url: &str,
+    jwt: JwtEnv,
+    timeouts: Timeouts,
+    deps: Deps,
+) -> Result<RpcClient, Error> {
     let url: Url = url.parse().map_err(|_| Error::InvalidUrl)?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(Error::UnsupportedScheme);
@@ -104,7 +128,9 @@ async fn connect_inner(url: &str, jwt: JwtEnv, deps: Deps) -> Result<RpcClient, 
             JwtEnv::Unset => {}
         }
         info!("RPC: plain HTTP");
-        return Ok(ClientBuilder::default().transport(St0xHttp::new(url, None)?, is_local));
+        return Ok(
+            ClientBuilder::default().transport(St0xHttp::new(url, None, timeouts)?, is_local)
+        );
     }
 
     let JwtEnv::Both(AlchemyJwtConfig { key_version, kid }) = jwt else {
@@ -116,8 +142,8 @@ async fn connect_inner(url: &str, jwt: JwtEnv, deps: Deps) -> Result<RpcClient, 
         let signer =
             KmsSigner::new(key_version.clone(), deps.kms_base_url, deps.token_source).await?;
         let minter = Arc::new(JwtMinter::new(signer, kid.clone()));
-        let client =
-            ClientBuilder::default().transport(St0xHttp::new(url, Some(minter))?, is_local);
+        let client = ClientBuilder::default()
+            .transport(St0xHttp::new(url, Some(minter), timeouts)?, is_local);
         let chain_id: String = client
             .request_noparams("eth_chainId")
             .await
@@ -174,9 +200,14 @@ mod tests {
         mock_kms(&server);
         let (_rpc, seen) = mock_rpc(&server, "/v2");
 
-        let client = connect_inner(&server.url("/v2"), both(), test_deps(&server))
-            .await
-            .unwrap();
+        let client = connect_inner(
+            &server.url("/v2"),
+            both(),
+            Timeouts::default(),
+            test_deps(&server),
+        )
+        .await
+        .unwrap();
         let chain_id: String = client.request_noparams("eth_chainId").await.unwrap();
         assert_eq!(chain_id, CHAIN_ID);
 
@@ -197,9 +228,14 @@ mod tests {
                 "ALCHEMY_JWT_KMS_KEY_VERSION or ALCHEMY_JWT_KID",
             ),
         ] {
-            let err = connect_inner(&server.url("/v2"), jwt, test_deps(&server))
-                .await
-                .unwrap_err();
+            let err = connect_inner(
+                &server.url("/v2"),
+                jwt,
+                Timeouts::default(),
+                test_deps(&server),
+            )
+            .await
+            .unwrap_err();
             assert!(
                 matches!(err, Error::MissingJwtConfig { missing } if missing == expected),
                 "{err:?}"
@@ -213,9 +249,14 @@ mod tests {
         for path in ["/v2/secret-api-key", "/rpc"] {
             for jwt in [both(), partial(), JwtEnv::Unset] {
                 let (mut rpc, seen) = mock_rpc(&server, path);
-                let client = connect_inner(&server.url(path), jwt, test_deps(&server))
-                    .await
-                    .unwrap();
+                let client = connect_inner(
+                    &server.url(path),
+                    jwt,
+                    Timeouts::default(),
+                    test_deps(&server),
+                )
+                .await
+                .unwrap();
                 rpc.assert_calls(0);
                 let _: String = client.request_noparams("eth_chainId").await.unwrap();
                 assert_eq!(*seen.lock().unwrap(), vec![Vec::<String>::new()]);
@@ -266,9 +307,14 @@ mod tests {
             then.status(401).body("unauthorized");
         });
 
-        let err = connect_inner(&server.url("/v2"), both(), test_deps(&server))
-            .await
-            .unwrap_err();
+        let err = connect_inner(
+            &server.url("/v2"),
+            both(),
+            Timeouts::default(),
+            test_deps(&server),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, Error::Rpc(_)), "{err:?}");
     }
 
@@ -285,7 +331,7 @@ mod tests {
             startup_timeout: Duration::from_millis(200),
             ..test_deps(&server)
         };
-        let err = connect_inner(&server.url("/v2"), both(), deps)
+        let err = connect_inner(&server.url("/v2"), both(), Timeouts::default(), deps)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::StartupTimeout), "{err:?}");
