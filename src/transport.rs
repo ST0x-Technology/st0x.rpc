@@ -1,0 +1,251 @@
+//! JSON-RPC over HTTP POST. Unlike alloy's `Http` transport, no error or
+//! span carries the URL, which can hold an Alchemy API key, and
+//! redirects are not followed.
+
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use alloy_json_rpc::{RequestPacket, ResponsePacket};
+use alloy_transport::{TransportError, TransportErrorKind, TransportFut, TransportResult};
+use reqwest::header::{HeaderValue, AUTHORIZATION};
+use reqwest::Url;
+
+use crate::jwt::JwtMinter;
+use crate::Error;
+
+#[derive(Clone)]
+pub(crate) struct St0xHttp {
+    client: reqwest::Client,
+    url: Url,
+    minter: Option<Arc<JwtMinter>>,
+}
+
+impl St0xHttp {
+    pub(crate) fn new(url: Url, minter: Option<Arc<JwtMinter>>) -> Result<Self, Error> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        Ok(Self {
+            client,
+            url,
+            minter,
+        })
+    }
+
+    async fn send(self, request: RequestPacket) -> TransportResult<ResponsePacket> {
+        let mut headers = request.headers();
+        if let Some(minter) = &self.minter {
+            let token = minter.bearer().await.map_err(TransportErrorKind::custom)?;
+            let mut bearer = HeaderValue::try_from(format!("Bearer {token}"))
+                .map_err(TransportErrorKind::custom)?;
+            bearer.set_sensitive(true);
+            headers.insert(AUTHORIZATION, bearer);
+        }
+
+        let response = self
+            .client
+            .post(self.url)
+            .json(&request)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|err| TransportErrorKind::custom(err.without_url()))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|err| TransportErrorKind::custom(err.without_url()))?;
+
+        if !status.is_success() {
+            return Err(TransportErrorKind::http_error(
+                status.as_u16(),
+                String::from_utf8_lossy(&body).into_owned(),
+            ));
+        }
+        serde_json::from_slice(&body)
+            .map_err(|err| TransportError::deser_err(err, String::from_utf8_lossy(&body)))
+    }
+}
+
+impl tower::Service<RequestPacket> for St0xHttp {
+    type Response = ResponsePacket;
+    type Error = TransportError;
+    type Future = TransportFut<'static>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: RequestPacket) -> Self::Future {
+        Box::pin(self.clone().send(request))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_json_rpc::{Id, Request};
+    use alloy_rpc_client::{ClientBuilder, RpcClient};
+    use httpmock::MockServer;
+    use tower::Service as _;
+
+    use super::*;
+    use crate::kms::JwsSigner;
+    use crate::test_support::{
+        kms_signer, mock_public_key, mock_rpc, mock_sign, mock_token, ACCESS_TOKEN, CHAIN_ID,
+    };
+
+    const SECRET_PATH: &str = "/v2/secret-api-key";
+
+    async fn minter(server: &MockServer) -> Arc<JwtMinter> {
+        mock_token(server);
+        mock_public_key(server, "EC_SIGN_P256_SHA256");
+        mock_sign(server);
+        Arc::new(JwtMinter::new(kms_signer(server).await, "kid".to_string()))
+    }
+
+    fn client(url: &str, minter: Option<Arc<JwtMinter>>) -> RpcClient {
+        ClientBuilder::default()
+            .transport(St0xHttp::new(url.parse().unwrap(), minter).unwrap(), true)
+    }
+
+    /// An `eth_chainId` request whose packet already carries
+    /// `Authorization: Bearer stale`.
+    fn request_with_stale_authorization(id: u64) -> alloy_json_rpc::SerializedRequest {
+        let mut request = Request::new("eth_chainId", Id::Number(id), ())
+            .serialize()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(AUTHORIZATION, HeaderValue::from_static("Bearer stale"));
+        request
+    }
+
+    fn assert_no_secrets(rendered: &str, server: &MockServer, jwt: Option<&str>) {
+        assert!(!rendered.contains(SECRET_PATH), "{rendered}");
+        assert!(
+            !rendered.contains(&server.address().to_string()),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(ACCESS_TOKEN), "{rendered}");
+        if let Some(jwt) = jwt {
+            assert!(!rendered.contains(jwt), "{rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_one_bearer_on_single_and_batch() {
+        let server = MockServer::start_async().await;
+        let minter = minter(&server).await;
+        let (rpc, seen) = mock_rpc(&server, "/v2");
+        let mut transport = St0xHttp::new(
+            server.url("/v2").parse().unwrap(),
+            Some(Arc::clone(&minter)),
+        )
+        .unwrap();
+
+        transport
+            .call(RequestPacket::Single(request_with_stale_authorization(1)))
+            .await
+            .unwrap();
+        let response = transport
+            .call(RequestPacket::Batch(vec![
+                request_with_stale_authorization(2),
+                request_with_stale_authorization(3),
+            ]))
+            .await
+            .unwrap();
+        assert!(matches!(response, ResponsePacket::Batch(ref responses) if responses.len() == 2));
+
+        let jwt = minter.bearer().await.unwrap();
+        let expected = vec![format!("Bearer {jwt}")];
+        assert_eq!(*seen.lock().unwrap(), vec![expected.clone(), expected]);
+        rpc.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn plain_mode_forwards_request_unchanged() {
+        let server = MockServer::start_async().await;
+        let (_rpc, seen) = mock_rpc(&server, "/rpc");
+
+        let chain_id: String = client(&server.url("/rpc"), None)
+            .request_noparams("eth_chainId")
+            .await
+            .unwrap();
+        assert_eq!(chain_id, CHAIN_ID);
+        assert_eq!(*seen.lock().unwrap(), vec![Vec::<String>::new()]);
+    }
+
+    #[tokio::test]
+    async fn does_not_follow_redirects() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method("POST").path(SECRET_PATH);
+            then.status(302)
+                .header("location", server.url("/elsewhere"));
+        });
+        let (target, _) = mock_rpc(&server, "/elsewhere");
+
+        let err = client(&server.url(SECRET_PATH), None)
+            .request_noparams::<String>("eth_chainId")
+            .await
+            .unwrap_err();
+        assert!(
+            err.as_transport_err()
+                .is_some_and(|kind| kind.as_http_error().is_some_and(|http| http.status == 302)),
+            "{err:?}"
+        );
+        target.assert_calls(0);
+    }
+
+    #[tokio::test]
+    async fn errors_carry_no_url_or_tokens() {
+        let server = MockServer::start_async().await;
+        let minter = minter(&server).await;
+        let jwt = minter.bearer().await.unwrap();
+        for status in [401, 500] {
+            let path = format!("{SECRET_PATH}-{status}");
+            server.mock(|when, then| {
+                when.method("POST").path(path.as_str());
+                then.status(status).body("unauthorized");
+            });
+            let err = client(&server.url(&path), Some(Arc::clone(&minter)))
+                .request_noparams::<String>("eth_chainId")
+                .await
+                .unwrap_err();
+            assert_no_secrets(&format!("{err} {err:?}"), &server, Some(&jwt));
+        }
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_url = format!("http://{}{SECRET_PATH}", closed.local_addr().unwrap());
+        drop(closed);
+        let err = client(&closed_url, Some(minter))
+            .request_noparams::<String>("eth_chainId")
+            .await
+            .unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains(SECRET_PATH), "{rendered}");
+        assert!(!rendered.contains(&jwt), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn mint_failure_is_a_transport_error() {
+        let server = MockServer::start_async().await;
+        mock_token(&server);
+        mock_public_key(&server, "EC_SIGN_P256_SHA256");
+        server.mock(|when, then| {
+            when.method("POST").path_includes(":asymmetricSign");
+            then.status(503).body("{}");
+        });
+        let signer = kms_signer(&server).await;
+        assert!(signer.sign(b"x").await.is_err());
+        let minter = Arc::new(JwtMinter::new(signer, "kid".to_string()));
+        let (rpc, _) = mock_rpc(&server, "/v2");
+
+        let err = client(&server.url("/v2"), Some(minter))
+            .request_noparams::<String>("eth_chainId")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("KMS returned HTTP 503"), "{err}");
+        rpc.assert_calls(0);
+    }
+}
