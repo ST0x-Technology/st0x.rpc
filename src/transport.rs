@@ -13,6 +13,12 @@ use reqwest::Url;
 use crate::jwt::JwtMinter;
 use crate::{Error, Timeouts};
 
+/// Response text kept in an error is cut to this many bytes.
+const MAX_ERROR_BODY: usize = 1024;
+/// URL parts at least this long are treated as secrets: API keys are
+/// 32 characters, network names and `v2` are short.
+const MIN_SECRET_LEN: usize = 16;
+
 #[derive(Clone)]
 pub(crate) struct St0xHttp {
     client: reqwest::Client,
@@ -53,7 +59,7 @@ impl St0xHttp {
 
         let response = self
             .client
-            .post(self.url)
+            .post(self.url.clone())
             .json(&request)
             .headers(headers)
             .send()
@@ -68,12 +74,40 @@ impl St0xHttp {
         if !status.is_success() {
             return Err(TransportErrorKind::http_error(
                 status.as_u16(),
-                String::from_utf8_lossy(&body).into_owned(),
+                redacted_body(&body, &self.url),
             ));
         }
         serde_json::from_slice(&body)
-            .map_err(|err| TransportError::deser_err(err, String::from_utf8_lossy(&body)))
+            .map_err(|err| TransportError::deser_err(err, redacted_body(&body, &self.url)))
     }
+}
+
+/// The response text for an error, without the URL's long path segments,
+/// query values and credentials (an endpoint can echo its keyed path), and
+/// cut to `MAX_ERROR_BODY` bytes.
+fn redacted_body(body: &[u8], url: &Url) -> String {
+    let mut text = String::from_utf8_lossy(body).into_owned();
+    let path = url.path_segments().into_iter().flatten().map(str::to_owned);
+    let query = url.query_pairs().map(|(_, value)| value.into_owned());
+    let credentials = [url.username().to_owned()]
+        .into_iter()
+        .chain(url.password().map(str::to_owned));
+    for secret in path
+        .chain(query)
+        .chain(credentials)
+        .filter(|part| part.len() >= MIN_SECRET_LEN)
+    {
+        text = text.replace(&secret, "<redacted>");
+    }
+    if text.len() > MAX_ERROR_BODY {
+        let end = (0..=MAX_ERROR_BODY)
+            .rev()
+            .find(|&index| text.is_char_boundary(index))
+            .unwrap_or(0);
+        text.truncate(end);
+        text.push_str("...");
+    }
+    text
 }
 
 impl tower::Service<RequestPacket> for St0xHttp {
@@ -313,5 +347,37 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("KMS returned HTTP 503"), "{err}");
         rpc.assert_calls(0);
+    }
+
+    #[tokio::test]
+    async fn echoed_keyed_path_is_redacted_from_errors() {
+        const KEY: &str = "AbCdEf0123456789ghijKLMNopqr";
+        let server = MockServer::start_async().await;
+        let keyed = format!("/v2/{KEY}");
+        for (path, status, body) in [
+            ("/http-error", 500, format!("no route for {keyed}")),
+            ("/bad-json", 200, format!("<html>{keyed}</html>")),
+        ] {
+            let url_path = format!("{path}{keyed}");
+            server.mock(|when, then| {
+                when.method("POST").path(url_path.as_str());
+                then.status(status).body(body.as_str());
+            });
+            let err = client(&server.url(&url_path), None)
+                .request_noparams::<String>("eth_chainId")
+                .await
+                .unwrap_err();
+            let rendered = format!("{err} {err:?}");
+            assert!(!rendered.contains(KEY), "{rendered}");
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn long_error_body_is_capped() {
+        let url: Url = "https://base-mainnet.g.alchemy.com/v2".parse().unwrap();
+        let text = redacted_body("é".repeat(MAX_ERROR_BODY).as_bytes(), &url);
+        assert!(text.len() <= MAX_ERROR_BODY + 3);
+        assert!(text.ends_with("..."));
     }
 }
