@@ -15,9 +15,12 @@ use crate::error::capped;
 use crate::jwt::JwtMinter;
 use crate::{Error, Timeouts};
 
-/// URL parts at least this long are treated as secrets: API keys are
+/// Path segments at least this long are treated as secrets: API keys are
 /// 32 characters, network names and `v2` are short.
 const MIN_SECRET_LEN: usize = 16;
+/// Query values and URL credentials are secrets from this length, which
+/// leaves flags like `?full=1` readable in error text.
+const MIN_CREDENTIAL_LEN: usize = 4;
 
 #[derive(Clone)]
 pub(crate) struct St0xHttp {
@@ -189,18 +192,24 @@ fn without_input(err: &serde_json::Error) -> serde_json::Error {
     ))
 }
 
-/// What an endpoint can echo from its request: the JWT and the URL's long
-/// path segments, query values and credentials.
+/// What an endpoint can echo from its request: the JWT, the URL's long path
+/// segments, and its query values and credentials.
 fn secrets(url: &Url, token: Option<&str>) -> Vec<String> {
-    let path = url.path_segments().into_iter().flatten().map(str::to_owned);
+    let path = url
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .filter(|segment| segment.len() >= MIN_SECRET_LEN)
+        .map(str::to_owned);
     let query = url.query_pairs().map(|(_, value)| value.into_owned());
     let credentials = [url.username().to_owned()]
         .into_iter()
         .chain(url.password().map(str::to_owned));
-    path.chain(query)
+    let short_ok = query
         .chain(credentials)
+        .filter(|part| part.len() >= MIN_CREDENTIAL_LEN);
+    path.chain(short_ok)
         .chain(token.map(str::to_owned))
-        .filter(|part| part.len() >= MIN_SECRET_LEN)
         .collect()
 }
 
@@ -697,6 +706,40 @@ mod tests {
             write!(escaped, "\\u{:04x}", u32::from(c)).unwrap();
             escaped
         })
+    }
+
+    #[tokio::test]
+    async fn short_credentials_are_redacted_from_errors() {
+        let server = MockServer::start_async().await;
+        let echo = "key short-api-key password hunter2";
+        let rpc_error = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "error": { "code": -32000, "message": echo, "data": echo },
+        })
+        .to_string();
+        for (path, status, body) in [
+            ("/http", 401, echo.to_owned()),
+            ("/json-rpc", 200, rpc_error),
+        ] {
+            server.mock(|when, then| {
+                when.method("POST").path(path);
+                then.status(status)
+                    .header("content-type", "application/json")
+                    .body(body.as_str());
+            });
+            let url = format!(
+                "http://user:hunter2@{}{path}?api_key=short-api-key&full=1",
+                server.address()
+            );
+            let err = client(&url, None)
+                .request_noparams::<String>("eth_chainId")
+                .await
+                .unwrap_err();
+            let rendered = format!("{err} {err:?}");
+            assert!(!rendered.contains("short-api-key"), "{rendered}");
+            assert!(!rendered.contains("hunter2"), "{rendered}");
+        }
     }
 
     #[test]

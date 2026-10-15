@@ -162,20 +162,15 @@ impl<S: JwsSigner> JwtMinter<S> {
     }
 
     async fn mint(&self) -> Result<String, Error> {
-        let iat = (self.clock)()?;
-        let exp = iat.checked_add(TTL_SECS).ok_or(Error::Clock)?;
-        let minted = self.encode(iat, exp).await;
-        let now = (self.clock)()?;
-        let minted = minted.and_then(|token| {
-            if now < exp {
-                Ok(token)
-            } else {
-                Err(Error::MintedExpired)
-            }
-        });
+        let (minted, started, now) = match self.mint_once().await? {
+            // Signing outlived the token, as when the process was paused
+            // mid-mint: sign once more with a fresh `iat`.
+            (Err(Error::MintedExpired), _, _) => self.mint_once().await?,
+            attempt => attempt,
+        };
         let mut state = self.lock_state();
         match minted {
-            Ok(token) => {
+            Ok((token, exp)) => {
                 state.cached = Some(Cached {
                     token: token.clone(),
                     exp,
@@ -184,7 +179,11 @@ impl<S: JwsSigner> JwtMinter<S> {
                 Ok(token)
             }
             Err(err) => {
-                state.retry_after = now.saturating_add(RETRY_BACKOFF_SECS);
+                // A mint that started a backoff period ago is already spaced
+                // from the last KMS call, so it adds no backoff of its own.
+                if now.saturating_sub(started) < RETRY_BACKOFF_SECS {
+                    state.retry_after = now.saturating_add(RETRY_BACKOFF_SECS);
+                }
                 warn!(kid = %self.kid, error = %err, "Alchemy JWT mint failed");
                 match state.cached.as_ref().filter(|cached| now < cached.exp) {
                     Some(cached) => Ok(cached.token.clone()),
@@ -192,6 +191,23 @@ impl<S: JwsSigner> JwtMinter<S> {
                 }
             }
         }
+    }
+
+    /// One signing attempt: the token and its `exp`, or why it failed,
+    /// with the clock read before and after signing.
+    async fn mint_once(&self) -> Result<(Result<(String, u64), Error>, u64, u64), Error> {
+        let iat = (self.clock)()?;
+        let exp = iat.checked_add(TTL_SECS).ok_or(Error::Clock)?;
+        let minted = self.encode(iat, exp).await;
+        let now = (self.clock)()?;
+        let minted = minted.and_then(|token| {
+            if now < exp {
+                Ok((token, exp))
+            } else {
+                Err(Error::MintedExpired)
+            }
+        });
+        Ok((minted, iat, now))
     }
 
     async fn encode(&self, iat: u64, exp: u64) -> Result<String, Error> {
@@ -477,8 +493,44 @@ mod tests {
         harness.wait_for_calls(1).await;
         harness.set_now(IAT + TTL_SECS);
         harness.signer().gate.add_permits(1);
+        harness.wait_for_calls(2).await;
+        harness.set_now(IAT + 2 * TTL_SECS);
+        harness.signer().gate.add_permits(1);
 
         assert!(matches!(minting.await.unwrap(), Err(Error::MintedExpired)));
+    }
+
+    #[tokio::test]
+    async fn late_mint_signs_again_without_backoff() {
+        let harness = Harness::new(FakeSigner::gated());
+        let minting = harness.spawn_bearer();
+        harness.wait_for_calls(1).await;
+        harness.set_now(IAT + TTL_SECS);
+        harness.signer().gate.add_permits(2);
+
+        let token = minting.await.unwrap().unwrap();
+        assert_eq!(harness.calls(), 2);
+        assert_eq!(harness.minter.bearer().await.unwrap(), token);
+        assert_eq!(harness.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn slow_failed_mint_sets_no_backoff() {
+        let harness = Harness::new(FakeSigner::gated());
+        harness.set_failing(true);
+        let minting = harness.spawn_bearer();
+        harness.wait_for_calls(1).await;
+        harness.set_now(IAT + RETRY_BACKOFF_SECS);
+        harness.signer().gate.add_permits(1);
+        assert!(matches!(
+            minting.await.unwrap(),
+            Err(Error::KmsStatus { .. })
+        ));
+
+        harness.set_failing(false);
+        harness.signer().gate.add_permits(1);
+        harness.minter.bearer().await.unwrap();
+        assert_eq!(harness.calls(), 2);
     }
 
     #[tokio::test]
