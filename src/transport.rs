@@ -203,14 +203,24 @@ struct Secrets {
     all: Vec<String>,
 }
 
+/// An echoed URL can carry each part as sent on the wire or decoded, so
+/// both forms are secrets.
+fn wire_and_decoded(raw: &str) -> [String; 2] {
+    [
+        raw.to_owned(),
+        percent_encoding::percent_decode_str(raw)
+            .decode_utf8_lossy()
+            .into_owned(),
+    ]
+}
+
 fn secrets(url: &Url, token: Option<&str>) -> Secrets {
     let path = url
         .path_segments()
         .into_iter()
         .flatten()
-        .filter(|segment| segment.len() >= MIN_SECRET_LEN)
-        .map(str::to_owned);
-    // An echoed URL can carry a query value decoded or as sent on the wire.
+        .flat_map(wire_and_decoded)
+        .filter(|segment| segment.len() >= MIN_SECRET_LEN);
     let raw_query_values = url
         .query()
         .into_iter()
@@ -220,8 +230,8 @@ fn secrets(url: &Url, token: Option<&str>) -> Secrets {
         .query_pairs()
         .map(|(_, value)| value.into_owned())
         .chain(raw_query_values)
-        .chain([url.username().to_owned()])
-        .chain(url.password().map(str::to_owned))
+        .chain(wire_and_decoded(url.username()))
+        .chain(url.password().into_iter().flat_map(wire_and_decoded))
         .filter(|part| part.len() >= MIN_CREDENTIAL_LEN)
         .collect();
     let long: Vec<String> = path
@@ -730,6 +740,29 @@ mod tests {
             write!(escaped, "\\u{:04x}", u32::from(c)).unwrap();
             escaped
         })
+    }
+
+    #[tokio::test]
+    async fn decoded_path_key_and_credentials_are_redacted_from_errors() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method("POST").path_includes("/v2/");
+            then.status(401)
+                .body("bad key AbCd/Ef0123456789ghijKLMNopqr for user us/er password hun/ter2");
+        });
+
+        let url = format!(
+            "http://us%2Fer:hun%2Fter2@{}/v2/AbCd%2FEf0123456789ghijKLMNopqr",
+            server.address()
+        );
+        let err = client(&url, None)
+            .request_noparams::<String>("eth_chainId")
+            .await
+            .unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        for secret in ["AbCd/Ef0123456789ghijKLMNopqr", "us/er", "hun/ter2"] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
     }
 
     #[tokio::test]
