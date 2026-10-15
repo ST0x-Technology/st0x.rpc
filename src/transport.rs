@@ -210,9 +210,16 @@ fn secrets(url: &Url, token: Option<&str>) -> Secrets {
         .flatten()
         .filter(|segment| segment.len() >= MIN_SECRET_LEN)
         .map(str::to_owned);
+    // An echoed URL can carry a query value decoded or as sent on the wire.
+    let raw_query_values = url
+        .query()
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .filter_map(|pair| pair.split_once('=').map(|(_, value)| value.to_owned()));
     let credentials: Vec<String> = url
         .query_pairs()
         .map(|(_, value)| value.into_owned())
+        .chain(raw_query_values)
         .chain([url.username().to_owned()])
         .chain(url.password().map(str::to_owned))
         .filter(|part| part.len() >= MIN_CREDENTIAL_LEN)
@@ -723,6 +730,26 @@ mod tests {
             write!(escaped, "\\u{:04x}", u32::from(c)).unwrap();
             escaped
         })
+    }
+
+    #[tokio::test]
+    async fn percent_encoded_query_key_is_redacted_from_errors() {
+        const ENCODED: &str = "AbCd%2FEf0123456789ghijKLMNopqr";
+        const DECODED: &str = "AbCd/Ef0123456789ghijKLMNopqr";
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method("POST").path("/rpc");
+            then.status(401)
+                .body(format!("bad key {ENCODED} (decoded {DECODED})"));
+        });
+
+        let err = client(&server.url(format!("/rpc?api_key={ENCODED}")), None)
+            .request_noparams::<String>("eth_chainId")
+            .await
+            .unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains(ENCODED), "{rendered}");
+        assert!(!rendered.contains(DECODED), "{rendered}");
     }
 
     #[tokio::test]
