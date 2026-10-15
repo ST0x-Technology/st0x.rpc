@@ -1,0 +1,43 @@
+[package]
+name = "st0x-rpc"
+version = "0.1.0"
+edition = "2021"
+license = "CAL-1.0-Combined-Work-Exception"
+repository = "https://github.com/ST0x-Technology/st0x.rpc"
+description = "alloy JSON-RPC client for ST0x services: Alchemy calls authenticated with ES256 JWTs signed by Cloud KMS."
+
+[dependencies]
+alloy-json-rpc = { version = "1.6", default-features = false }
+alloy-rpc-client = { version = "1.6", default-features = false }
+alloy-transport = { version = "1.6", default-features = false }
+base64 = "0.22"
+percent-encoding = "2"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "gzip",
+  "http2",
+  "json",
+  "rustls",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+tower = { version = "0.5", default-features = false }
+tracing = "0.1"
+
+[dev-dependencies]
+flate2 = "1"
+httpmock = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
