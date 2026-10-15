@@ -80,11 +80,11 @@ impl St0xHttp {
         if !status.is_success() {
             return Err(TransportErrorKind::http_error(
                 status.as_u16(),
-                redacted_body(&body, &secrets),
+                redacted_body(&body, &secrets.all),
             ));
         }
         let mut packet: ResponsePacket = serde_json::from_slice(&body).map_err(|err| {
-            TransportError::deser_err(without_input(&err), redacted_body(&body, &secrets))
+            TransportError::deser_err(without_input(&err), redacted_body(&body, &secrets.all))
         })?;
         redact_payloads(&mut packet, &secrets);
         Ok(packet)
@@ -95,8 +95,8 @@ impl St0xHttp {
 /// and `data`, and a `result` that does not deserialize into the caller's
 /// type. They get the same redaction as an error body, except that numbers
 /// in a `result` stay numbers, so a caller asking for a `u64` still gets one.
-fn redact_payloads(packet: &mut ResponsePacket, secrets: &[String]) {
-    if secrets.is_empty() {
+fn redact_payloads(packet: &mut ResponsePacket, secrets: &Secrets) {
+    if secrets.all.is_empty() {
         return;
     }
     let responses = match packet {
@@ -106,14 +106,14 @@ fn redact_payloads(packet: &mut ResponsePacket, secrets: &[String]) {
     for response in responses {
         match &mut response.payload {
             ResponsePayload::Success(result) => {
-                *result = redacted_json(std::mem::take(result), secrets, Numbers::Keep);
+                *result = redacted_json(std::mem::take(result), &secrets.long, Numbers::Keep);
             }
             ResponsePayload::Failure(error) => {
-                error.message = redacted(&error.message, secrets).into();
+                error.message = redacted(&error.message, &secrets.all).into();
                 error.data = error
                     .data
                     .take()
-                    .map(|data| redacted_json(data, secrets, Numbers::Redact));
+                    .map(|data| redacted_json(data, &secrets.all, Numbers::Redact));
             }
         }
     }
@@ -192,25 +192,39 @@ fn without_input(err: &serde_json::Error) -> serde_json::Error {
     ))
 }
 
-/// What an endpoint can echo from its request: the JWT, the URL's long path
-/// segments, and its query values and credentials.
-fn secrets(url: &Url, token: Option<&str>) -> Vec<String> {
-    let path = url
+/// What an endpoint can echo from its request.
+struct Secrets {
+    /// The JWT and the URL's long path segments: long enough that replacing
+    /// them cannot hit real data, so they are redacted from `result`s too.
+    long: Vec<String>,
+    /// `long` plus the URL's query values and credentials, which can be as
+    /// short as a hex run inside a block hash. Used for error text only.
+    all: Vec<String>,
+}
+
+fn secrets(url: &Url, token: Option<&str>) -> Secrets {
+    let long: Vec<String> = url
         .path_segments()
         .into_iter()
         .flatten()
         .filter(|segment| segment.len() >= MIN_SECRET_LEN)
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .chain(token.map(str::to_owned))
+        .collect();
     let query = url.query_pairs().map(|(_, value)| value.into_owned());
     let credentials = [url.username().to_owned()]
         .into_iter()
         .chain(url.password().map(str::to_owned));
-    let short_ok = query
-        .chain(credentials)
-        .filter(|part| part.len() >= MIN_CREDENTIAL_LEN);
-    path.chain(short_ok)
-        .chain(token.map(str::to_owned))
-        .collect()
+    let all = long
+        .iter()
+        .cloned()
+        .chain(
+            query
+                .chain(credentials)
+                .filter(|part| part.len() >= MIN_CREDENTIAL_LEN),
+        )
+        .collect();
+    Secrets { long, all }
 }
 
 fn redacted(text: &str, secrets: &[String]) -> String {
@@ -689,11 +703,11 @@ mod tests {
         let raw =
             RawValue::from_string(r#"{"echo":1234567890123456,"code":7}"#.to_owned()).unwrap();
         assert_eq!(
-            redacted_json(raw.clone(), &secrets(&url, None), Numbers::Redact).get(),
+            redacted_json(raw.clone(), &secrets(&url, None).all, Numbers::Redact).get(),
             r#"{"code":7,"echo":"<redacted>"}"#
         );
         assert_eq!(
-            redacted_json(raw.clone(), &secrets(&url, None), Numbers::Keep).get(),
+            redacted_json(raw.clone(), &secrets(&url, None).all, Numbers::Keep).get(),
             raw.get()
         );
     }
@@ -743,9 +757,33 @@ mod tests {
     }
 
     #[test]
+    fn short_credentials_leave_results_untouched() {
+        let url: Url = "https://rpc.example/?chainId=8453".parse().unwrap();
+        let mut packet: ResponsePacket = serde_json::from_str(
+            r#"[{"jsonrpc":"2.0","id":1,"result":"0x84531234"},
+                {"jsonrpc":"2.0","id":2,"error":{"code":1,"message":"bad 8453"}}]"#,
+        )
+        .unwrap();
+        redact_payloads(&mut packet, &secrets(&url, None));
+
+        let responses = packet.responses();
+        let ResponsePayload::Success(result) = &responses[0].payload else {
+            panic!("expected a result");
+        };
+        assert_eq!(result.get(), r#""0x84531234""#);
+        let ResponsePayload::Failure(error) = &responses[1].payload else {
+            panic!("expected an error");
+        };
+        assert_eq!(error.message, "bad <redacted>");
+    }
+
+    #[test]
     fn long_error_body_is_capped() {
         let url: Url = "https://base-mainnet.g.alchemy.com/v2".parse().unwrap();
-        let text = redacted_body("é".repeat(MAX_ERROR_BODY).as_bytes(), &secrets(&url, None));
+        let text = redacted_body(
+            "é".repeat(MAX_ERROR_BODY).as_bytes(),
+            &secrets(&url, None).all,
+        );
         assert!(text.len() <= MAX_ERROR_BODY + 3);
         assert!(text.ends_with("..."));
     }
