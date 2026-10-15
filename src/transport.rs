@@ -194,36 +194,39 @@ fn without_input(err: &serde_json::Error) -> serde_json::Error {
 
 /// What an endpoint can echo from its request.
 struct Secrets {
-    /// The JWT and the URL's long path segments: long enough that replacing
-    /// them cannot hit real data, so they are redacted from `result`s too.
+    /// The JWT and the URL's path segments, query values and credentials of
+    /// `MIN_SECRET_LEN` or more: long enough that replacing them cannot hit
+    /// real data, so they are redacted from `result`s too.
     long: Vec<String>,
-    /// `long` plus the URL's query values and credentials, which can be as
+    /// `long` plus the shorter query values and credentials, which can be as
     /// short as a hex run inside a block hash. Used for error text only.
     all: Vec<String>,
 }
 
 fn secrets(url: &Url, token: Option<&str>) -> Secrets {
-    let long: Vec<String> = url
+    let path = url
         .path_segments()
         .into_iter()
         .flatten()
         .filter(|segment| segment.len() >= MIN_SECRET_LEN)
-        .map(str::to_owned)
+        .map(str::to_owned);
+    let credentials: Vec<String> = url
+        .query_pairs()
+        .map(|(_, value)| value.into_owned())
+        .chain([url.username().to_owned()])
+        .chain(url.password().map(str::to_owned))
+        .filter(|part| part.len() >= MIN_CREDENTIAL_LEN)
+        .collect();
+    let long: Vec<String> = path
+        .chain(
+            credentials
+                .iter()
+                .filter(|part| part.len() >= MIN_SECRET_LEN)
+                .cloned(),
+        )
         .chain(token.map(str::to_owned))
         .collect();
-    let query = url.query_pairs().map(|(_, value)| value.into_owned());
-    let credentials = [url.username().to_owned()]
-        .into_iter()
-        .chain(url.password().map(str::to_owned));
-    let all = long
-        .iter()
-        .cloned()
-        .chain(
-            query
-                .chain(credentials)
-                .filter(|part| part.len() >= MIN_CREDENTIAL_LEN),
-        )
-        .collect();
+    let all = long.iter().chain(&credentials).cloned().collect();
     Secrets { long, all }
 }
 
@@ -754,6 +757,37 @@ mod tests {
             assert!(!rendered.contains("short-api-key"), "{rendered}");
             assert!(!rendered.contains("hunter2"), "{rendered}");
         }
+    }
+
+    #[tokio::test]
+    async fn long_query_key_is_redacted_from_mismatched_results() {
+        const KEY: &str = "AbCdEf0123456789ghijKLMNopqr";
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method("POST").path("/rpc");
+            then.respond_with(|request| {
+                let call: serde_json::Value =
+                    serde_json::from_slice(&request.body().to_vec()).unwrap();
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": call["id"],
+                    "result": format!("no route for /rpc?api_key={KEY}"),
+                });
+                httpmock::HttpMockResponse::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(body.to_string())
+                    .build()
+            });
+        });
+
+        let err = client(&server.url(format!("/rpc?api_key={KEY}")), None)
+            .request_noparams::<serde_json::Map<String, serde_json::Value>>("eth_getBlockByNumber")
+            .await
+            .unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains(KEY), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 
     #[test]
